@@ -9,20 +9,21 @@ common single-pedal model. Other pedals work too if you adjust the IDs (see belo
 
 ## How it works
 
-1. **Reads the pedal directly.** The pedal enumerates as a USB HID keyboard. The app
-   matches it by vendor/product ID with `IOHIDManager` and treats any key-down from it
-   as a "press" — it doesn't matter which key the pedal is programmed to send, so no
-   Windows configuration software is needed.
-2. **Suppresses the stray keystroke.** By default the device is *seized* (opened
-   exclusively), so the key it would otherwise type never reaches the focused app. The
-   pedal becomes a dedicated approve button. Toggle this off in the menu if you'd rather
-   keep its normal keystroke.
-3. **Sends ⌘↩ to Claude.** Claude's permission prompt binds **⌘↩ (Command-Return)** to
-   "Allow once". On a pedal press the app brings Claude to the front (if it isn't
-   already) and injects that chord into the system event stream. This is deliberately
-   *not* an accessibility-tree button press — Claude's prompt is web content that
-   doesn't expose tappable AX buttons, so replaying its keyboard shortcut is far more
-   reliable.
+1. **Reads the pedal directly.** The pedal enumerates as a USB HID keyboard (this unit
+   is configured to type Return). The app matches it by vendor/product ID with
+   `IOHIDManager` and treats any key-down from it as a press — no Windows config tool
+   needed. It reads the device *non-exclusively*: macOS doesn't let a userspace app
+   truly seize a keyboard (trying it blocks event delivery and re-enumerates the device
+   in a loop), so seizing isn't an option.
+2. **Sends ⌘↩ to Claude.** Claude's permission prompt binds **⌘↩ (Command-Return)** to
+   "Allow once". On a press the app brings Claude to the front (if needed) and injects
+   that chord. Replaying the shortcut is far more reliable than poking the accessibility
+   tree, which Claude's web-based prompt doesn't expose as tappable buttons.
+3. **Suppresses the pedal's own Return.** Because the device isn't seized, its Return
+   would otherwise leak to the focused app (and could submit a line in a terminal). A
+   `CGEventTap` drops that Return in a brief window *armed by a confirmed pedal press*.
+   Your real Enter key is untouched (it's outside the window), and our own ⌘↩ is
+   untouched (it carries the Command flag; only the pedal's *plain* Return is dropped).
 
 ## Requirements
 
@@ -37,67 +38,71 @@ make run        # build the .app and launch it
 make install    # build, copy to /Applications, and launch from there
 ```
 
-The build is signed with a **stable local identity** (created automatically by
-`scripts/signing-setup.sh` in a dedicated keychain). That matters: ad-hoc signing
-changes the app's code hash on every build, which makes macOS silently revoke your
-permission grants. With the stable identity, **you grant once and it sticks across
-rebuilds**. (Set `CODE_SIGN_IDENTITY="Developer ID Application: …"` to use your own.)
+**Signing matters here.** macOS revokes Accessibility / Input Monitoring grants whenever
+an app's code signature changes, so ad-hoc signing (new hash every build) would make you
+re-grant constantly. The build picks the most stable identity available, in order:
+
+1. `CODE_SIGN_IDENTITY="…"` if you set it
+2. a **Developer ID Application** identity, if you have one (auto-detected; hardened
+   runtime, notarization-ready, Team-ID-stable)
+3. a **stable local self-signed** identity (`scripts/signing-setup.sh`, created in a
+   dedicated keychain)
+4. ad-hoc (last resort)
+
+With any real identity, **you grant permissions once and they persist across rebuilds.**
 
 On first launch, grant **two** permissions:
 
 | Permission | Why | Where |
 |---|---|---|
 | **Input Monitoring** | read the foot pedal | System Settings ▸ Privacy & Security ▸ Input Monitoring |
-| **Accessibility** | send ⌘↩ to Claude | System Settings ▸ Privacy & Security ▸ Accessibility |
+| **Accessibility** | send ⌘↩ and run the Return-suppression event tap | System Settings ▸ Privacy & Security ▸ Accessibility |
 
-The app re-checks live and starts working within a couple of seconds of granting — no
-relaunch needed in most cases. If a grant isn't detected, use **Relaunch** in the menu.
-The **Permissions** section shows ✓/✕ and links straight to each pane.
+The app re-checks live and starts within a couple of seconds of granting. Input
+Monitoring only takes effect for a process that had it at launch, so the app
+**relaunches itself automatically** once you enable it. The menu's **Permissions**
+section shows ✓/✕ and links straight to each pane.
 
 ## Using it
 
-- Look for the 👣 **footprints icon** in the menu bar. Full opacity = ready (pedal
-  connected + permissions granted); dimmed = something's missing (open the menu).
-- When Claude shows a permission prompt, **press the pedal**. The icon flashes green on
-  success, red on failure.
-- **Approve Claude (send ⌘↩) now** in the menu does the same thing without the pedal —
-  use it to test.
+- The 👣 **footprints icon** in the menu bar is full-opacity when ready (pedal connected
+  + both permissions), dimmed otherwise.
+- With a Claude permission prompt up, **press the pedal** → menu icon flashes a **green
+  checkmark** and Claude approves.
+- **Approve Claude (send ⌘↩) now** in the menu does the same without the pedal.
 
 ## Menu reference
 
 - **Approve Claude (send ⌘↩) now** — fire the action manually (test).
-- **Suppress pedal's own keystroke** — toggle seizing the device (on by default).
-- **Permissions** — live ✓/✕; click a row to open the right Settings pane. A
-  **Relaunch** item appears here if a grant isn't being picked up.
-- **Diagnostics ▸ Log pedal events** — log every raw HID event to Console:
-  `log stream --predicate 'subsystem == "net.phfactor.ClaudeFootswitch"'`
-- **Diagnostics ▸ Show Claude's buttons…** — lists any buttons Claude exposes to
-  Accessibility (usually none — confirming why we send a keystroke instead).
+- **Suppress pedal's own Return** — toggle the event-tap suppression (on by default).
+- **Permissions** — live ✓/✕; click a row to open the right Settings pane; **Relaunch**
+  appears if a grant isn't picked up.
+- **Diagnostics ▸ Log pedal events** — also log raw HID values.
+- **Diagnostics ▸ Show Claude's buttons…** — what the AX tree exposes (usually nothing,
+  which is why we send a keystroke).
 - **Launch at login** — register as a login item.
+
+A plain-text activity log is always written to `~/Library/Logs/ClaudeFootswitch.log`
+(launch state, HID open, presses, approvals, suppressed Returns) — handy for debugging.
 
 ## Troubleshooting
 
 - **Pedal flashes green but Claude doesn't approve.** The prompt window must belong to
-  Claude. The app brings Claude to the front and sends ⌘↩; confirm ⌘↩ is the "Allow
-  once" shortcut in your Claude build (it's shown on the button). Watch the live log
-  (above) while pressing to see what's sent.
-- **Permissions show ✕ even though you granted them.** Almost always stale grants from a
-  previous *ad-hoc* build. Clear and re-grant on the stable-signed build:
-  ```sh
-  make reset-tcc && make install
-  ```
-- **Pedal not detected.** Confirm it's the expected device:
-  ```sh
-  ioreg -p IOUSB -l -w 0 | grep -iE 'Foot Switch|idVendor|idProduct'
-  ```
+  Claude, and ⌘↩ must be its "Allow once" shortcut (shown on the button). Tail the log:
+  `tail -f ~/Library/Logs/ClaudeFootswitch.log` while pressing.
+- **The pedal's Enter still leaks.** Make sure **Suppress pedal's own Return** is on and
+  Accessibility is granted (the tap needs it). The log shows `tap Return … SUPPRESSED`.
+- **Permissions show ✕ after granting.** Almost always a stale grant from an earlier
+  ad-hoc build. Clear and re-grant on the signed build: `make reset-tcc && make install`.
+- **Pedal not detected.** `ioreg -p IOUSB -l -w 0 | grep -iE 'Foot Switch|idVendor|idProduct'`
 - **A different pedal.** Change `vendorID` / `productID` in
-  `Sources/ClaudeFootswitch/HIDFootswitch.swift` and rebuild.
+  `Sources/ClaudeFootswitch/HIDFootswitch.swift` and rebuild. If it types something other
+  than Return, change `returnKeyCode` in `KeyboardSuppressor.swift` too.
 
 ## Configuration (defaults)
 
 ```sh
 defaults write net.phfactor.ClaudeFootswitch targetBundleID "com.anthropic.claudefordesktop"
-defaults write net.phfactor.ClaudeFootswitch seizeDevice -bool true
 defaults write net.phfactor.ClaudeFootswitch debounceMs -int 250
 ```
 
@@ -105,17 +110,18 @@ defaults write net.phfactor.ClaudeFootswitch debounceMs -int 250
 
 ```
 Sources/ClaudeFootswitch/
-  main.swift          NSApplication bootstrap (accessory / menu-bar)
-  AppDelegate.swift   status item, menu, permission flow, wiring
-  HIDFootswitch.swift IOHIDManager pedal watcher (match, seize, debounce)
-  AllowOnce.swift     finds Claude and sends the ⌘↩ "Allow once" chord
-  Permissions.swift   Input Monitoring + Accessibility helpers
-  Settings.swift      UserDefaults-backed configuration
-Resources/Info.plist  LSUIElement bundle metadata
-Resources/AppIcon.icns app icon
-tools/make-icon.swift  renders the app icon at every size
+  main.swift              NSApplication bootstrap (accessory / menu-bar)
+  AppDelegate.swift       status item, menu, permission flow, wiring
+  HIDFootswitch.swift     IOHIDManager pedal watcher (match, debounce)
+  AllowOnce.swift         finds Claude and sends the ⌘↩ "Allow once" chord
+  KeyboardSuppressor.swift CGEventTap that drops the pedal's stray Return
+  Permissions.swift       Input Monitoring + Accessibility helpers
+  Settings.swift          UserDefaults-backed configuration
+  Diag.swift              plain-text activity log
+Resources/                Info.plist + AppIcon.icns
+tools/make-icon.swift     renders the app icon at every size
 scripts/signing-setup.sh  creates the stable local signing identity
-scripts/make-icon.sh   renders + packs AppIcon.icns
-scripts/make-app.sh    build + assemble + sign the .app
-Makefile               build / icon / run / install / debug / reset-tcc
+scripts/make-icon.sh      renders + packs AppIcon.icns
+scripts/make-app.sh       build + assemble + sign the .app
+Makefile                  build / icon / run / install / debug / reset-tcc
 ```

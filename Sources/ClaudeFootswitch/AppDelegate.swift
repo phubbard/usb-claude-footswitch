@@ -7,10 +7,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let settings = Settings()
     private let hid = HIDFootswitch()
     private let allowOnce = AllowOnce()
+    private let suppressor = KeyboardSuppressor()
 
     private var statusItem: NSStatusItem!
     private var permWatch: Timer?
     private var hidStarted = false
+    private var suppressorStarted = false
     private var didShowLaunchGuidance = false
     private var imGrantedAtLaunch = false
 
@@ -22,7 +24,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Diag.log("=== launch: accessibility=\(Permissions.accessibilityTrusted) inputMonitoring=\(imGrantedAtLaunch) ===")
 
         hid.debounceInterval = Double(settings.debounceMs) / 1000.0
-        hid.onPress = { [weak self] in self?.handlePress() }
+        hid.onPress = { [weak self] in
+            self?.suppressor.arm() // drop the pedal's stray Return before it lands
+            self?.handlePress()
+        }
         hid.onConnectionChange = { [weak self] _ in self?.updateIcon() }
 
         setupStatusItem()
@@ -43,6 +48,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func evaluatePermissions(promptIfMissing: Bool) {
         let ax = Permissions.accessibilityTrusted
         let im = Permissions.inputMonitoringGranted
+        if ax { startSuppressorIfNeeded() }
 
         if ax && im {
             stopPermWatch()
@@ -96,6 +102,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Diag.log("startHID: opening device")
         hid.start()
         hidStarted = true
+    }
+
+    private func startSuppressorIfNeeded() {
+        guard !suppressorStarted, Permissions.accessibilityTrusted else { return }
+        suppressor.start()
+        suppressorStarted = suppressor.isRunning
     }
 
     private func showPermissionGuidance(ax: Bool, im: Bool) {
@@ -181,6 +193,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
 
         menu.addItem(action("Approve Claude (send ⌘↩) now", #selector(testApprove)))
+        let suppressItem = action("Suppress pedal’s own Return", #selector(toggleSuppress))
+        suppressItem.state = suppressor.enabled ? .on : .off
+        if !suppressor.isRunning { suppressItem.toolTip = "Needs Accessibility permission" }
+        menu.addItem(suppressItem)
         menu.addItem(.separator())
 
         menu.addItem(disabled("Permissions"))
@@ -210,6 +226,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: Menu actions
 
     @objc private func toggleLogging() { hid.logEvents.toggle() }
+
+    @objc private func toggleSuppress() { suppressor.enabled.toggle() }
 
     @objc private func showButtons() {
         let labels = allowOnce.allPressableLabels()
@@ -264,18 +282,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func flash(success: Bool) {
         guard let button = statusItem.button else { return }
-        // Swap to a solid colored glyph briefly. (contentTintColor doesn't reliably tint a
-        // template menu-bar image, so the old "tint" flash was often invisible.)
         let symbol = success ? "checkmark.circle.fill" : "xmark.octagon.fill"
         let color: NSColor = success ? .systemGreen : .systemRed
-        if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
-            .withSymbolConfiguration(.init(paletteColors: [color])) {
-            image.isTemplate = false
+        if let image = coloredSymbol(symbol, color) {
             button.image = image
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
             self?.updateIcon()
         }
+    }
+
+    /// A solidly tinted (non-template) menu-bar glyph — same fill trick as the app icon,
+    /// which renders reliably where contentTintColor / paletteColors did not.
+    private func coloredSymbol(_ name: String, _ color: NSColor) -> NSImage? {
+        let config = NSImage.SymbolConfiguration(pointSize: 15, weight: .bold)
+        guard let base = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+            .withSymbolConfiguration(config) else { return nil }
+        let image = NSImage(size: base.size)
+        image.lockFocus()
+        base.draw(at: .zero, from: NSRect(origin: .zero, size: base.size), operation: .sourceOver, fraction: 1)
+        color.set()
+        NSRect(origin: .zero, size: base.size).fill(using: .sourceAtop)
+        image.unlockFocus()
+        image.isTemplate = false
+        return image
     }
 
     @discardableResult
