@@ -12,11 +12,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var permWatch: Timer?
     private var hidStarted = false
     private var didShowLaunchGuidance = false
+    private var imGrantedAtLaunch = false
 
     // MARK: Launch
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         allowOnce.targetBundleID = settings.bundleID
+        imGrantedAtLaunch = Permissions.inputMonitoringGranted
 
         hid.debounceInterval = Double(settings.debounceMs) / 1000.0
         hid.onPress = { [weak self] in self?.handlePress() }
@@ -42,8 +44,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let im = Permissions.inputMonitoringGranted
 
         if ax && im {
-            startHIDIfNeeded()
             stopPermWatch()
+            if imGrantedAtLaunch {
+                startHIDIfNeeded()
+            } else {
+                // Input Monitoring was granted while running. IOHIDManager only starts
+                // receiving events in a process that had the grant at launch, so relaunch.
+                log.notice("Input Monitoring granted at runtime — relaunching to read the pedal.")
+                relaunchApp()
+            }
             updateIcon()
             return
         }

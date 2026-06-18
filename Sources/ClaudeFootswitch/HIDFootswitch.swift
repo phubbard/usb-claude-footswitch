@@ -63,14 +63,18 @@ final class HIDFootswitch {
 
         IOHIDManagerScheduleWithRunLoop(mgr, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
 
-        let options: IOOptionBits = seize
-            ? IOOptionBits(kIOHIDOptionsTypeSeizeDevice)
-            : IOOptionBits(kIOHIDOptionsTypeNone)
-        let result = IOHIDManagerOpen(mgr, options)
+        let seizeOptions = IOOptionBits(kIOHIDOptionsTypeSeizeDevice)
+        let noneOptions = IOOptionBits(kIOHIDOptionsTypeNone)
+        var result = IOHIDManagerOpen(mgr, seize ? seizeOptions : noneOptions)
+        if result != kIOReturnSuccess, seize {
+            // Seizing can fail where a plain open succeeds — fall back so the pedal still works.
+            log.notice("Seize open failed (\(String(format: "0x%08X", result), privacy: .public)); retrying without seize.")
+            result = IOHIDManagerOpen(mgr, noneOptions)
+        }
         if result != kIOReturnSuccess {
-            log.error("IOHIDManagerOpen failed: \(String(format: "0x%08X", result), privacy: .public) (seize=\(seize, privacy: .public)). Is Input Monitoring granted?")
+            log.error("IOHIDManagerOpen failed: \(String(format: "0x%08X", result), privacy: .public). Input Monitoring likely not granted — grant it, then relaunch.")
         } else {
-            log.info("HID manager opened (seize=\(seize, privacy: .public)).")
+            log.notice("HID manager opened (seize=\(seize, privacy: .public)).")
         }
         refreshConnected()
     }
@@ -95,7 +99,7 @@ final class HIDFootswitch {
     private func setConnected(_ value: Bool) {
         guard value != isConnected else { return }
         isConnected = value
-        log.info("Pedal \(value ? "connected" : "disconnected", privacy: .public).")
+        log.notice("Pedal \(value ? "connected" : "disconnected", privacy: .public).")
         onConnectionChange?(value)
     }
 
@@ -127,7 +131,7 @@ final class HIDFootswitch {
         guard now.timeIntervalSince(lastFire) >= debounceInterval else { return }
         lastFire = now
 
-        log.info("Pedal pressed.")
+        log.notice("Pedal pressed.")
         onPress?()
     }
 }
