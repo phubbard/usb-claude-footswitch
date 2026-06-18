@@ -3,7 +3,6 @@ import Foundation
 /// UserDefaults-backed configuration.
 final class Settings {
     private enum Key {
-        static let seize = "seizeDevice"
         static let bundleID = "targetBundleID"
         static let debounceMs = "debounceMs"
     }
@@ -14,16 +13,9 @@ final class Settings {
 
     init() {
         d.register(defaults: [
-            Key.seize: true,
             Key.bundleID: Settings.defaultBundleID,
             Key.debounceMs: 250,
         ])
-    }
-
-    /// Open the pedal exclusively so its own keystroke never reaches the focused app.
-    var seize: Bool {
-        get { d.bool(forKey: Key.seize) }
-        set { d.set(newValue, forKey: Key.seize) }
     }
 
     /// Bundle identifier of the app holding the prompt.

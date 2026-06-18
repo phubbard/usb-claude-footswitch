@@ -19,6 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         allowOnce.targetBundleID = settings.bundleID
         imGrantedAtLaunch = Permissions.inputMonitoringGranted
+        Diag.log("=== launch: accessibility=\(Permissions.accessibilityTrusted) inputMonitoring=\(imGrantedAtLaunch) ===")
 
         hid.debounceInterval = Double(settings.debounceMs) / 1000.0
         hid.onPress = { [weak self] in self?.handlePress() }
@@ -51,6 +52,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 // Input Monitoring was granted while running. IOHIDManager only starts
                 // receiving events in a process that had the grant at launch, so relaunch.
                 log.notice("Input Monitoring granted at runtime — relaunching to read the pedal.")
+                Diag.log("Input Monitoring granted at runtime → relaunching")
                 relaunchApp()
             }
             updateIcon()
@@ -86,8 +88,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func startHIDIfNeeded() {
-        guard Permissions.inputMonitoringGranted, !hidStarted else { return }
-        hid.start(seize: settings.seize)
+        if hidStarted { return }
+        guard Permissions.inputMonitoringGranted else {
+            Diag.log("startHID skipped: Input Monitoring not granted")
+            return
+        }
+        Diag.log("startHID: opening device")
+        hid.start()
         hidStarted = true
     }
 
@@ -118,6 +125,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func handlePress() {
         let result = allowOnce.approve()
         log.info("Press → \(result.message, privacy: .public)")
+        Diag.log("approve: success=\(result.success) — \(result.message)")
         flash(success: result.success)
     }
 
@@ -173,9 +181,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
 
         menu.addItem(action("Approve Claude (send ⌘↩) now", #selector(testApprove)))
-        let seizeItem = action("Suppress pedal’s own keystroke", #selector(toggleSeize))
-        seizeItem.state = settings.seize ? .on : .off
-        menu.addItem(seizeItem)
         menu.addItem(.separator())
 
         menu.addItem(disabled("Permissions"))
@@ -203,11 +208,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // MARK: Menu actions
-
-    @objc private func toggleSeize() {
-        settings.seize.toggle()
-        if Permissions.inputMonitoringGranted { hid.start(seize: settings.seize); hidStarted = true }
-    }
 
     @objc private func toggleLogging() { hid.logEvents.toggle() }
 
@@ -264,9 +264,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func flash(success: Bool) {
         guard let button = statusItem.button else { return }
-        button.contentTintColor = success ? .systemGreen : .systemRed
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak button] in
-            button?.contentTintColor = nil
+        // Swap to a solid colored glyph briefly. (contentTintColor doesn't reliably tint a
+        // template menu-bar image, so the old "tint" flash was often invisible.)
+        let symbol = success ? "checkmark.circle.fill" : "xmark.octagon.fill"
+        let color: NSColor = success ? .systemGreen : .systemRed
+        if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(paletteColors: [color])) {
+            image.isTemplate = false
+            button.image = image
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.updateIcon()
         }
     }
 
