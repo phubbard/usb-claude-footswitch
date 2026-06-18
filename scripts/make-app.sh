@@ -3,13 +3,13 @@
 #
 # Env overrides:
 #   CONFIG=debug|release        (default: release)
-#   CODE_SIGN_IDENTITY="..."    (default: "-" ad-hoc; use a Developer ID for stable TCC grants)
+#   CODE_SIGN_IDENTITY="..."    (default: a stable local identity via signing-setup.sh;
+#                                set to a Developer ID to use your own)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
 CONFIG="${CONFIG:-release}"
-IDENTITY="${CODE_SIGN_IDENTITY:--}"
 APP_NAME="Claude Footswitch"
 EXECUTABLE="ClaudeFootswitch"
 APP="build/${APP_NAME}.app"
@@ -31,8 +31,22 @@ cp Resources/Info.plist "$APP/Contents/Info.plist"
 cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
+# Stable local identity by default so macOS keeps your Accessibility / Input Monitoring
+# grants across rebuilds. Override with CODE_SIGN_IDENTITY=... (e.g. a Developer ID).
+KEYCHAIN_FLAG=()
+if [ -n "${CODE_SIGN_IDENTITY:-}" ]; then
+    IDENTITY="$CODE_SIGN_IDENTITY"
+elif OUT="$(bash scripts/signing-setup.sh)"; then
+    eval "$OUT"
+    IDENTITY="$SIGN_IDENTITY"
+    KEYCHAIN_FLAG=(--keychain "$SIGN_KEYCHAIN")
+else
+    echo "⚠ Local signing setup failed; using ad-hoc (TCC grants won't survive rebuilds)."
+    IDENTITY="-"
+fi
+
 echo "▸ Signing (identity: $IDENTITY)…"
-codesign --force --sign "$IDENTITY" --timestamp=none "$APP"
+codesign --force --sign "$IDENTITY" "${KEYCHAIN_FLAG[@]}" --timestamp=none "$APP"
 
 echo "✓ Built $APP"
 echo

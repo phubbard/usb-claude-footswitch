@@ -1,80 +1,94 @@
 import AppKit
 import ApplicationServices
+import CoreGraphics
 import os
 
 struct AllowOnceResult {
-    let pressed: Bool
+    let success: Bool
     let message: String
-    let discoveredLabels: [String]
 }
 
-/// Finds and presses the target button (default "Allow once") inside the Claude
-/// desktop app using the Accessibility API. Works even when Claude is in the
-/// background and regardless of where its window sits.
+/// Approves Claude's prompt by sending the "Allow once" keyboard shortcut (⌘↩) to the
+/// Claude app.
 ///
-/// Claude is an Electron/Chromium app, so its buttons live in a web a11y tree that
-/// Chromium only exposes on demand — we flip that on with the `AXManualAccessibility`
-/// attribute before searching.
+/// This is deliberately *not* an accessibility-tree button press: Claude's permission UI
+/// is web content that doesn't reliably expose tappable AX buttons, but it does bind ⌘↩
+/// to "Allow once". Synthesizing that chord is simpler and far more reliable. Posting
+/// keystrokes to another app still requires Accessibility permission.
 final class AllowOnce {
     private let log = Logger(subsystem: "net.phfactor.ClaudeFootswitch", category: "AllowOnce")
 
     var targetBundleID = Settings.defaultBundleID
-    var label = Settings.defaultLabel
 
-    private let maxNodes = 12_000
-    private let maxDepth = 70
+    private let commandKey: CGKeyCode = 55 // kVK_Command
+    private let returnKey: CGKeyCode = 36  // kVK_Return
 
-    // MARK: Public
+    // MARK: Approve
 
     @discardableResult
-    func press(dryRun: Bool = false) -> AllowOnceResult {
+    func approve() -> AllowOnceResult {
         guard Permissions.accessibilityTrusted else {
-            return AllowOnceResult(pressed: false, message: "Accessibility permission not granted.", discoveredLabels: [])
+            return AllowOnceResult(success: false, message: "Accessibility permission not granted (needed to send keystrokes).")
         }
-        let apps = candidateApps()
-        guard !apps.isEmpty else {
-            return AllowOnceResult(pressed: false, message: "Claude isn’t running (looked for \(targetBundleID)).", discoveredLabels: [])
+        guard let app = candidateApps().first else {
+            return AllowOnceResult(success: false, message: "Claude isn’t running (looked for \(targetBundleID)).")
         }
 
-        let needle = label.lowercased()
-        var seen: [String] = []
+        let pid = app.processIdentifier
+        let name = app.localizedName ?? "Claude"
 
-        for app in apps {
-            let axApp = appElement(for: app)
-            var match: AXUIElement?
-
-            traverse(axApp) { element, pressable, text in
-                guard pressable, !text.isEmpty else { return true }
-                seen.append(text)
-                if text.lowercased().contains(needle) {
-                    match = element
-                    return false // stop traversal
-                }
-                return true
-            }
-
-            if let button = match {
-                if dryRun {
-                    return AllowOnceResult(pressed: false, message: "Found “\(label)” (dry run).", discoveredLabels: seen)
-                }
-                let err = AXUIElementPerformAction(button, kAXPressAction as CFString)
-                if err == .success {
-                    log.info("Pressed “\(self.label, privacy: .public)”.")
-                    return AllowOnceResult(pressed: true, message: "Pressed “\(label)”.", discoveredLabels: seen)
-                }
-                return AllowOnceResult(pressed: false, message: "Found “\(label)” but the press failed (AXError \(err.rawValue)).", discoveredLabels: seen)
+        // Claude's ⌘↩ accelerator only fires when it's the key app. If it isn't frontmost,
+        // bring it forward, then inject the chord into the system event stream.
+        if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid {
+            sendCommandReturn()
+        } else {
+            app.activate(options: [.activateIgnoringOtherApps])
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+                self?.sendCommandReturn()
             }
         }
 
-        return AllowOnceResult(pressed: false, message: "No “\(label)” button visible right now.", discoveredLabels: seen)
+        log.info("Sent ⌘↩ to \(name, privacy: .public).")
+        return AllowOnceResult(success: true, message: "Sent ⌘↩ to \(name).")
     }
 
-    /// Every pressable label currently exposed by the target app (diagnostics).
+    private func sendCommandReturn() {
+        let source = CGEventSource(stateID: .combinedSessionState)
+        func post(_ key: CGKeyCode, keyDown: Bool, flags: CGEventFlags) {
+            guard let event = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: keyDown) else { return }
+            event.flags = flags
+            event.post(tap: .cghidEventTap)
+        }
+        // Full chord: Command down, Return down+up (with Command held), Command up.
+        post(commandKey, keyDown: true, flags: .maskCommand)
+        post(returnKey, keyDown: true, flags: .maskCommand)
+        post(returnKey, keyDown: false, flags: .maskCommand)
+        post(commandKey, keyDown: false, flags: [])
+    }
+
+    // MARK: Target app
+
+    func targetAppName() -> String? { candidateApps().first?.localizedName }
+    func isTargetRunning() -> Bool { !candidateApps().isEmpty }
+
+    private func candidateApps() -> [NSRunningApplication] {
+        let running = NSWorkspace.shared.runningApplications
+        let exact = running.filter { $0.bundleIdentifier == targetBundleID }
+        if !exact.isEmpty { return exact }
+        return running.filter {
+            ($0.bundleIdentifier ?? "").hasPrefix("com.anthropic.") || $0.localizedName == "Claude"
+        }
+    }
+
+    // MARK: Diagnostics — list buttons the AX tree exposes (best-effort)
+
     func allPressableLabels() -> [String] {
         guard Permissions.accessibilityTrusted else { return [] }
         var labels: [String] = []
         for app in candidateApps() {
-            traverse(appElement(for: app)) { _, pressable, text in
+            let axApp = AXUIElementCreateApplication(app.processIdentifier)
+            AXUIElementSetAttributeValue(axApp, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+            traverse(axApp) { _, pressable, text in
                 if pressable, !text.isEmpty { labels.append(text) }
                 return true
             }
@@ -82,78 +96,28 @@ final class AllowOnce {
         return labels
     }
 
-    func targetAppName() -> String? {
-        candidateApps().first?.localizedName
-    }
-
-    // MARK: App resolution
-
-    private func candidateApps() -> [NSRunningApplication] {
-        let running = NSWorkspace.shared.runningApplications
-        let exact = running.filter { $0.bundleIdentifier == targetBundleID }
-        if !exact.isEmpty { return exact }
-        // Fall back to any Anthropic app / one literally named "Claude".
-        return running.filter {
-            ($0.bundleIdentifier ?? "").hasPrefix("com.anthropic.") || $0.localizedName == "Claude"
-        }
-    }
-
-    private func appElement(for app: NSRunningApplication) -> AXUIElement {
-        let axApp = AXUIElementCreateApplication(app.processIdentifier)
-        // Force Chromium/Electron to build and expose its web accessibility tree.
-        AXUIElementSetAttributeValue(axApp, "AXManualAccessibility" as CFString, kCFBooleanTrue)
-        return axApp
-    }
-
-    // MARK: Tree walking
-
-    /// Depth-first walk. `visit` receives (element, isPressable, label) and returns
-    /// false to stop the whole traversal early.
     private func traverse(_ root: AXUIElement, visit: (AXUIElement, Bool, String) -> Bool) {
         var stack: [(AXUIElement, Int)] = [(root, 0)]
         var visited = 0
-
         while let (element, depth) = stack.popLast() {
             visited += 1
-            if visited > maxNodes { break }
-
+            if visited > 12_000 { break }
             let pressable = actionNames(element).contains(kAXPressAction)
-            let text = pressable ? combinedLabel(element) : ""
+            let text = pressable ? label(of: element) : ""
             if !visit(element, pressable, text) { return }
-
-            if depth < maxDepth {
-                for child in children(element) {
-                    stack.append((child, depth + 1))
-                }
+            if depth < 70 {
+                for child in children(element) { stack.append((child, depth + 1)) }
             }
         }
     }
 
-    /// A pressable element's own labels plus any nearby static-text descendants —
-    /// Electron often puts a button's visible text in a child node.
-    private func combinedLabel(_ element: AXUIElement) -> String {
+    private func label(of element: AXUIElement) -> String {
         var parts: [String] = []
         for attr in [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute, kAXHelpAttribute] {
             if let s = stringAttr(element, attr), !s.isEmpty { parts.append(s) }
         }
-
-        var stack: [(AXUIElement, Int)] = children(element).map { ($0, 1) }
-        var scanned = 0
-        while let (node, depth) = stack.popLast(), scanned < 80 {
-            scanned += 1
-            if stringAttr(node, kAXRoleAttribute) == "AXStaticText",
-               let s = stringAttr(node, kAXValueAttribute) ?? stringAttr(node, kAXTitleAttribute),
-               !s.isEmpty {
-                parts.append(s)
-            }
-            if depth < 4 {
-                for child in children(node) { stack.append((child, depth + 1)) }
-            }
-        }
         return parts.joined(separator: " ")
     }
-
-    // MARK: AX attribute helpers
 
     private func stringAttr(_ element: AXUIElement, _ attribute: String) -> String? {
         var value: CFTypeRef?

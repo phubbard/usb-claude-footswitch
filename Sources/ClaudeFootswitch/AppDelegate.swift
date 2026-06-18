@@ -9,12 +9,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let allowOnce = AllowOnce()
 
     private var statusItem: NSStatusItem!
+    private var permWatch: Timer?
+    private var hidStarted = false
+    private var didShowLaunchGuidance = false
 
     // MARK: Launch
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         allowOnce.targetBundleID = settings.bundleID
-        allowOnce.label = settings.label
 
         hid.debounceInterval = Double(settings.debounceMs) / 1000.0
         hid.onPress = { [weak self] in self?.handlePress() }
@@ -23,8 +25,101 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setupStatusItem()
         updateIcon()
 
-        promptForMissingPermissions()
-        startHID()
+        // React quickly when the user toggles Accessibility in System Settings.
+        DistributedNotificationCenter.default().addObserver(
+            self, selector: #selector(recheckPermissions),
+            name: NSNotification.Name("com.apple.accessibility.api"), object: nil)
+
+        evaluatePermissions(promptIfMissing: true)
+    }
+
+    // MARK: Permissions
+
+    /// Checks live state. Starts everything if granted; otherwise requests what's missing
+    /// (once) and watches for the grant so we recover without re-nagging.
+    private func evaluatePermissions(promptIfMissing: Bool) {
+        let ax = Permissions.accessibilityTrusted
+        let im = Permissions.inputMonitoringGranted
+
+        if ax && im {
+            startHIDIfNeeded()
+            stopPermWatch()
+            updateIcon()
+            return
+        }
+
+        if promptIfMissing {
+            if !ax { Permissions.accessibilityTrusted(prompt: true) }
+            if !im { Permissions.requestInputMonitoring() }
+            if !didShowLaunchGuidance {
+                didShowLaunchGuidance = true
+                showPermissionGuidance(ax: ax, im: im)
+            }
+        }
+        startPermWatch()
+        updateIcon()
+    }
+
+    @objc private func recheckPermissions() {
+        evaluatePermissions(promptIfMissing: false)
+    }
+
+    private func startPermWatch() {
+        guard permWatch == nil else { return }
+        permWatch = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.evaluatePermissions(promptIfMissing: false)
+        }
+    }
+
+    private func stopPermWatch() {
+        permWatch?.invalidate()
+        permWatch = nil
+    }
+
+    private func startHIDIfNeeded() {
+        guard Permissions.inputMonitoringGranted, !hidStarted else { return }
+        hid.start(seize: settings.seize)
+        hidStarted = true
+    }
+
+    private func showPermissionGuidance(ax: Bool, im: Bool) {
+        let alert = NSAlert()
+        alert.messageText = "Two permissions needed"
+        alert.informativeText = """
+        Claude Footswitch needs:
+
+        • Input Monitoring — to read the foot pedal\(im ? "  ✓ granted" : "")
+        • Accessibility — to send ⌘↩ to Claude\(ax ? "  ✓ granted" : "")
+
+        Enable the missing one(s) in System Settings ▸ Privacy & Security. The app picks \
+        up the change automatically — no need to relaunch in most cases.
+        """
+        alert.addButton(withTitle: "Open Input Monitoring")
+        alert.addButton(withTitle: "Open Accessibility")
+        alert.addButton(withTitle: "Later")
+        switch runModal(alert) {
+        case .alertFirstButtonReturn: Permissions.openInputMonitoringSettings()
+        case .alertSecondButtonReturn: Permissions.openAccessibilitySettings()
+        default: break
+        }
+    }
+
+    // MARK: Pedal → approve
+
+    private func handlePress() {
+        let result = allowOnce.approve()
+        log.info("Press → \(result.message, privacy: .public)")
+        flash(success: result.success)
+    }
+
+    @objc private func testApprove() {
+        let result = allowOnce.approve()
+        flash(success: result.success)
+        guard !result.success else { return }
+        let alert = NSAlert()
+        alert.messageText = "Couldn’t send ⌘↩"
+        alert.informativeText = result.message
+        runModal(alert)
     }
 
     // MARK: Status item & menu
@@ -37,7 +132,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func updateIcon() {
-        guard let button = statusItem.button else { return }
+        guard let button = statusItem?.button else { return }
         if let image = NSImage(systemSymbolName: "shoeprints.fill", accessibilityDescription: "Claude Footswitch") {
             image.isTemplate = true
             button.image = image
@@ -46,30 +141,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             button.image = nil
             button.title = "🦶"
         }
-        button.alphaValue = hid.isConnected ? 1.0 : 0.4
-        button.toolTip = hid.isConnected ? "Foot pedal connected" : "Foot pedal not found"
+        let ready = hid.isConnected && Permissions.accessibilityTrusted && Permissions.inputMonitoringGranted
+        button.alphaValue = ready ? 1.0 : 0.4
+        button.toolTip = statusSummary()
     }
 
-    /// Rebuilt every time the menu opens, so state is always current.
+    private func statusSummary() -> String {
+        if !Permissions.inputMonitoringGranted || !Permissions.accessibilityTrusted {
+            return "Permissions needed — open the menu"
+        }
+        return hid.isConnected ? "Ready — stomp to approve" : "Foot pedal not found"
+    }
+
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
+        let ax = Permissions.accessibilityTrusted
+        let im = Permissions.inputMonitoringGranted
 
         menu.addItem(disabled("Claude Footswitch"))
         menu.addItem(disabled(hid.isConnected ? "  ● Pedal connected" : "  ○ Pedal not found"))
-        let appName = allowOnce.targetAppName() ?? settings.bundleID
-        menu.addItem(disabled("  → \(appName)"))
+        menu.addItem(disabled("  → \(allowOnce.targetAppName() ?? settings.bundleID)"))
         menu.addItem(.separator())
 
-        menu.addItem(action("Press “\(settings.label)” now", #selector(testPress)))
-
+        menu.addItem(action("Approve Claude (send ⌘↩) now", #selector(testApprove)))
         let seizeItem = action("Suppress pedal’s own keystroke", #selector(toggleSeize))
         seizeItem.state = settings.seize ? .on : .off
         menu.addItem(seizeItem)
         menu.addItem(.separator())
 
         menu.addItem(disabled("Permissions"))
-        menu.addItem(action("  Input Monitoring: \(mark(Permissions.inputMonitoringGranted))", #selector(fixInputMonitoring)))
-        menu.addItem(action("  Accessibility: \(mark(Permissions.accessibilityTrusted))", #selector(fixAccessibility)))
+        menu.addItem(action("  Input Monitoring: \(mark(im))", #selector(fixInputMonitoring)))
+        menu.addItem(action("  Accessibility: \(mark(ax))", #selector(fixAccessibility)))
+        if !(ax && im) {
+            menu.addItem(action("  Relaunch (if a grant isn’t detected)", #selector(relaunchApp)))
+        }
         menu.addItem(.separator())
 
         let diagnostics = NSMenu()
@@ -85,50 +190,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         loginItem.state = launchAtLoginEnabled ? .on : .off
         menu.addItem(loginItem)
         menu.addItem(.separator())
-
         menu.addItem(action("Quit", #selector(quit)))
-    }
-
-    // MARK: Pedal → button
-
-    private func handlePress() {
-        let result = allowOnce.press()
-        log.info("Press → \(result.message, privacy: .public)")
-        flash(success: result.pressed)
-    }
-
-    @objc private func testPress() {
-        let result = allowOnce.press()
-        flash(success: result.pressed)
-        guard !result.pressed else { return }
-        let alert = NSAlert()
-        alert.messageText = "Couldn’t press “\(settings.label)”"
-        var info = result.message
-        if !result.discoveredLabels.isEmpty {
-            info += "\n\nButtons currently visible:\n• " + result.discoveredLabels.prefix(20).joined(separator: "\n• ")
-        }
-        alert.informativeText = info
-        runModal(alert)
     }
 
     // MARK: Menu actions
 
     @objc private func toggleSeize() {
         settings.seize.toggle()
-        hid.start(seize: settings.seize)
+        if Permissions.inputMonitoringGranted { hid.start(seize: settings.seize); hidStarted = true }
     }
 
-    @objc private func toggleLogging() {
-        hid.logEvents.toggle()
-    }
+    @objc private func toggleLogging() { hid.logEvents.toggle() }
 
     @objc private func showButtons() {
         let labels = allowOnce.allPressableLabels()
-        log.info("Visible buttons: \(labels.joined(separator: " | "), privacy: .public)")
         let alert = NSAlert()
-        alert.messageText = "Buttons Claude is exposing"
+        alert.messageText = "Buttons Claude exposes to Accessibility"
         alert.informativeText = labels.isEmpty
-            ? "None found.\n\nMake sure a Claude permission prompt is on screen, Claude is running, and Accessibility is granted to this app."
+            ? "None found — which is expected: Claude's prompt is web content that doesn't expose AX buttons. That's why this app sends ⌘↩ instead of pressing a button."
             : "• " + labels.joined(separator: "\n• ")
         runModal(alert)
     }
@@ -141,6 +220,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func fixAccessibility() {
         Permissions.accessibilityTrusted(prompt: true)
         Permissions.openAccessibilitySettings()
+    }
+
+    @objc private func relaunchApp() {
+        let url = Bundle.main.bundleURL
+        let config = NSWorkspace.OpenConfiguration()
+        config.createsNewApplicationInstance = true
+        NSWorkspace.shared.openApplication(at: url, configuration: config) { _, _ in
+            DispatchQueue.main.async { NSApp.terminate(nil) }
+        }
     }
 
     @objc private func toggleLaunchAtLogin() {
@@ -156,50 +244,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    @objc private func quit() {
-        NSApp.terminate(nil)
-    }
+    @objc private func quit() { NSApp.terminate(nil) }
 
     // MARK: Helpers
 
     private var launchAtLoginEnabled: Bool {
         guard #available(macOS 13, *) else { return false }
         return SMAppService.mainApp.status == .enabled
-    }
-
-    private func startHID() {
-        if !Permissions.inputMonitoringGranted {
-            Permissions.requestInputMonitoring()
-        }
-        hid.start(seize: settings.seize)
-    }
-
-    private func promptForMissingPermissions() {
-        let ax = Permissions.accessibilityTrusted
-        let im = Permissions.inputMonitoringGranted
-        guard !(ax && im) else { return }
-
-        if !ax { Permissions.accessibilityTrusted(prompt: true) }
-        if !im { Permissions.requestInputMonitoring() }
-
-        let alert = NSAlert()
-        alert.messageText = "Two permissions needed"
-        alert.informativeText = """
-        Claude Footswitch needs:
-
-        • Input Monitoring — to read the foot pedal\(im ? " ✓" : "")
-        • Accessibility — to press Claude’s “\(settings.label)” button\(ax ? " ✓" : "")
-
-        Enable them under System Settings ▸ Privacy & Security, then relaunch this app.
-        """
-        alert.addButton(withTitle: "Open Input Monitoring")
-        alert.addButton(withTitle: "Open Accessibility")
-        alert.addButton(withTitle: "Later")
-        switch runModal(alert) {
-        case .alertFirstButtonReturn: Permissions.openInputMonitoringSettings()
-        case .alertSecondButtonReturn: Permissions.openAccessibilitySettings()
-        default: break
-        }
     }
 
     private func flash(success: Bool) {
