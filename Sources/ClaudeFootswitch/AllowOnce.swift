@@ -36,15 +36,22 @@ final class AllowOnce {
 
         let pid = app.processIdentifier
         let name = app.localizedName ?? "Claude"
+        let previous = NSWorkspace.shared.frontmostApplication
 
         // Claude's ⌘↩ accelerator only fires when it's the key app. If it isn't frontmost,
-        // bring it forward, then inject the chord into the system event stream.
-        if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid {
+        // bring it forward, send the chord, then hand focus straight back to where the user
+        // was — so Claude can sit off to the side and they stay in flow (Mail, etc.).
+        if previous?.processIdentifier == pid {
             sendCommandReturn()
         } else {
             app.activate(options: [.activateIgnoringOtherApps])
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
                 self?.sendCommandReturn()
+                guard let previous, previous.processIdentifier != pid else { return }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    previous.activate(options: [.activateIgnoringOtherApps])
+                    Diag.log("restored focus to \(previous.localizedName ?? "previous app")")
+                }
             }
         }
 
