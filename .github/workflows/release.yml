@@ -1,0 +1,66 @@
+name: Release
+
+# Cut a release by pushing a tag:  git tag v1.0.0 && git push origin v1.0.0
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag to build (e.g. v1.0.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    env:
+      DEVELOPER_ID_P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+      DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+      AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+      AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+      AC_API_KEY_P8: ${{ secrets.AC_API_KEY_P8 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive version
+        run: |
+          REF="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "TAG=$REF" >> "$GITHUB_ENV"
+          echo "VERSION=${REF#v}" >> "$GITHUB_ENV"
+
+      - name: Import Developer ID certificate
+        run: bash scripts/ci-keychain.sh
+
+      - name: Build universal signed app
+        env:
+          UNIVERSAL: "1"
+          SECURE_TIMESTAMP: "1"
+        run: bash scripts/make-app.sh
+
+      - name: Notarize & staple app
+        run: bash scripts/notarize.sh "build/Claude Footswitch.app"
+
+      - name: Build DMG
+        env:
+          SECURE_TIMESTAMP: "1"
+        run: bash scripts/make-dmg.sh
+
+      - name: Notarize & staple DMG
+        run: bash scripts/notarize.sh "build/ClaudeFootswitch-${VERSION}.dmg"
+
+      - name: Verify final signature & notarization
+        run: |
+          spctl -a -t open --context context:primary-signature -vv "build/ClaudeFootswitch-${VERSION}.dmg" || true
+          codesign -dvvv "build/Claude Footswitch.app" 2>&1 | grep -E "Authority|TeamIdentifier" || true
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" \
+            "build/ClaudeFootswitch-${VERSION}.dmg" \
+            --title "Claude Footswitch ${VERSION}" \
+            --generate-notes

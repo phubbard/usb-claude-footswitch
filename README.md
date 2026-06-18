@@ -70,6 +70,8 @@ section shows ✓/✕ and links straight to each pane.
 - With a Claude permission prompt up, **press the pedal** → menu icon flashes a **green
   checkmark** and Claude approves.
 - **Approve Claude (send ⌘↩) now** in the menu does the same without the pedal.
+- Keep Claude **off to the side**: if it isn't frontmost when you stomp, the app briefly
+  focuses it to approve, then hands focus back to where you were — stomp and stay in flow.
 
 ## Menu reference
 
@@ -106,6 +108,33 @@ defaults write net.phfactor.ClaudeFootswitch targetBundleID "com.anthropic.claud
 defaults write net.phfactor.ClaudeFootswitch debounceMs -int 250
 ```
 
+## Releasing
+
+CI (`.github/workflows/ci.yml`) builds and checks a universal bundle on every push and PR.
+
+To cut a release, push a version tag — `.github/workflows/release.yml` builds a
+**universal, Developer ID-signed, notarized** app, packages a DMG, and publishes it to
+GitHub Releases:
+
+```sh
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+For signing + notarization, add these repository secrets (Settings ▸ Secrets and
+variables ▸ Actions). Without them the workflow still builds a DMG — just ad-hoc-signed.
+
+| Secret | What | How to get it |
+|---|---|---|
+| `DEVELOPER_ID_P12_BASE64` | Developer ID Application cert **+ private key**, base64'd | Keychain Access ▸ export the cert as `.p12`, then `base64 -i cert.p12 \| pbcopy` |
+| `DEVELOPER_ID_P12_PASSWORD` | the `.p12` export password | you set it on export |
+| `AC_API_KEY_ID` | App Store Connect API **Key ID** | App Store Connect ▸ Users and Access ▸ Integrations ▸ App Store Connect API |
+| `AC_API_ISSUER_ID` | the **Issuer ID** shown on that page | same page |
+| `AC_API_KEY_P8` | the `.p8` key contents | downloaded once when you create the key; paste the whole file |
+
+Locally: `make release-local` builds a universal signed app + DMG (using your Developer ID
+if present); `make dmg` packages whatever `make build` / `make universal` produced.
+
 ## Project layout
 
 ```
@@ -113,15 +142,20 @@ Sources/ClaudeFootswitch/
   main.swift              NSApplication bootstrap (accessory / menu-bar)
   AppDelegate.swift       status item, menu, permission flow, wiring
   HIDFootswitch.swift     IOHIDManager pedal watcher (match, debounce)
-  AllowOnce.swift         finds Claude and sends the ⌘↩ "Allow once" chord
+  AllowOnce.swift         finds Claude, sends ⌘↩, restores focus
   KeyboardSuppressor.swift CGEventTap that drops the pedal's stray Return
   Permissions.swift       Input Monitoring + Accessibility helpers
   Settings.swift          UserDefaults-backed configuration
   Diag.swift              plain-text activity log
 Resources/                Info.plist + AppIcon.icns
 tools/make-icon.swift     renders the app icon at every size
-scripts/signing-setup.sh  creates the stable local signing identity
-scripts/make-icon.sh      renders + packs AppIcon.icns
-scripts/make-app.sh       build + assemble + sign the .app
-Makefile                  build / icon / run / install / debug / reset-tcc
+scripts/
+  make-app.sh             build (universal/versioned) + assemble + sign
+  make-dmg.sh             package the app into a signed DMG
+  notarize.sh             notarize + staple (App Store Connect API key)
+  signing-setup.sh        stable local self-signed identity
+  ci-keychain.sh          import the Developer ID cert in CI
+  make-icon.sh            render + pack AppIcon.icns
+.github/workflows/        ci.yml (build check) + release.yml (tagged release)
+Makefile                  build / universal / dmg / install / release-local / …
 ```

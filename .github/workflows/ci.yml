@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: swift --version && xcodebuild -version
+
+      - name: Build (debug)
+        run: swift build
+
+      - name: Assemble universal app bundle (ad-hoc)
+        env:
+          UNIVERSAL: "1"
+          CODE_SIGN_IDENTITY: "-"   # no secrets needed for a build check
+        run: bash scripts/make-app.sh
+
+      - name: Verify it's a universal binary
+        run: |
+          lipo -archs "build/Claude Footswitch.app/Contents/MacOS/ClaudeFootswitch"
+          lipo -archs "build/Claude Footswitch.app/Contents/MacOS/ClaudeFootswitch" | grep -q "arm64 x86_64\|x86_64 arm64"

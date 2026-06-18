@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# Build the executable with SwiftPM and assemble a proper .app bundle.
+# Build the executable with SwiftPM and assemble a signed .app bundle.
 #
 # Env overrides:
-#   CONFIG=debug|release        (default: release)
-#   CODE_SIGN_IDENTITY="..."    (default: a stable local identity via signing-setup.sh;
-#                                set to a Developer ID to use your own)
+#   CONFIG=debug|release       (default: release)
+#   UNIVERSAL=1                build a universal arm64+x86_64 binary
+#   VERSION=1.2.3              stamp this version into the bundle's Info.plist
+#   SECURE_TIMESTAMP=1         use a secure timestamp (required for notarization)
+#   CODE_SIGN_IDENTITY="..."   force a signing identity. Otherwise: a Developer ID if one
+#                              is present, else a stable local self-signed identity, else
+#                              ad-hoc. Any real identity keeps TCC grants across rebuilds.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -14,9 +18,14 @@ APP_NAME="Claude Footswitch"
 EXECUTABLE="ClaudeFootswitch"
 APP="build/${APP_NAME}.app"
 
-echo "▸ Building ($CONFIG)…"
-swift build -c "$CONFIG"
-BIN="$(swift build -c "$CONFIG" --show-bin-path)/$EXECUTABLE"
+ARCH_FLAGS=()
+if [ "${UNIVERSAL:-0}" = "1" ]; then
+    ARCH_FLAGS=(--arch arm64 --arch x86_64)
+fi
+
+echo "▸ Building ($CONFIG${UNIVERSAL:+, universal})…"
+swift build -c "$CONFIG" ${ARCH_FLAGS[@]+"${ARCH_FLAGS[@]}"}
+BIN="$(swift build -c "$CONFIG" ${ARCH_FLAGS[@]+"${ARCH_FLAGS[@]}"} --show-bin-path)/$EXECUTABLE"
 
 if [ ! -f Resources/AppIcon.icns ]; then
     echo "▸ Icon missing — building it…"
@@ -31,21 +40,19 @@ cp Resources/Info.plist "$APP/Contents/Info.plist"
 cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
-# Signing identity, in priority order. Any real identity keeps macOS TCC grants
-# (Accessibility, Input Monitoring) across rebuilds; ad-hoc does not.
-#   1. CODE_SIGN_IDENTITY override
-#   2. a "Developer ID Application" identity (stable, Gatekeeper-trusted, notarizable)
-#   3. a stable local self-signed identity (scripts/signing-setup.sh)
-#   4. ad-hoc fallback
+if [ -n "${VERSION:-}" ]; then
+    /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist"
+    echo "▸ Stamped version $VERSION"
+fi
+
+# Resolve a signing identity.
 KEYCHAIN_FLAG=()
-SIGN_OPTS=()
-DEV_ID="$(security find-identity -v -p codesigning | awk -F'"' '/Developer ID Application/{print $2; exit}')"
+DEV_ID="$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/Developer ID Application/{print $2; exit}')"
 if [ -n "${CODE_SIGN_IDENTITY:-}" ]; then
     IDENTITY="$CODE_SIGN_IDENTITY"
-    SIGN_OPTS=(--options runtime)
 elif [ -n "$DEV_ID" ]; then
     IDENTITY="$DEV_ID"
-    SIGN_OPTS=(--options runtime)   # hardened runtime → notarization-ready
 elif OUT="$(bash scripts/signing-setup.sh)"; then
     eval "$OUT"
     IDENTITY="$SIGN_IDENTITY"
@@ -55,16 +62,20 @@ else
     IDENTITY="-"
 fi
 
+SIGN_OPTS=()
+TS=(--timestamp=none)
+if [ "$IDENTITY" != "-" ]; then
+    SIGN_OPTS=(--options runtime)   # hardened runtime → notarization-ready
+    [ "${SECURE_TIMESTAMP:-0}" = "1" ] && TS=(--timestamp)
+fi
+
 echo "▸ Signing (identity: $IDENTITY)…"
-# ${arr[@]+"${arr[@]}"} expands safely to nothing when the array is empty (bash 3.2 + set -u).
 codesign --force --sign "$IDENTITY" \
     ${KEYCHAIN_FLAG[@]+"${KEYCHAIN_FLAG[@]}"} \
     ${SIGN_OPTS[@]+"${SIGN_OPTS[@]}"} \
-    --timestamp=none "$APP"
+    "${TS[@]}" "$APP"
 
-echo "✓ Built $APP"
+codesign --verify --strict "$APP"
+echo "✓ Built & signed $APP"
 echo
-echo "Next:"
-echo "  • Launch:        open \"$APP\""
-echo "  • Install:       make install   (copies to /Applications)"
-echo "  • Grant Input Monitoring + Accessibility when prompted, then relaunch."
+echo "Next:  open \"$APP\"   •   make dmg   •   make install"
