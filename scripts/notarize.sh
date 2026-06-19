@@ -33,7 +33,7 @@ submit() {
         --wait
 }
 
-echo "▸ Notarizing $TARGET…"
+echo "▸ Notarizing ${TARGET}…"
 case "$TARGET" in
     *.app)
         # notarytool can't take a bare .app — zip it, submit, then staple the app itself.
@@ -47,6 +47,6 @@ case "$TARGET" in
         ;;
 esac
 
-echo "▸ Stapling $TARGET…"
+echo "▸ Stapling ${TARGET}…"
 xcrun stapler staple "$TARGET"
 echo "✓ Notarized & stapled $TARGET"

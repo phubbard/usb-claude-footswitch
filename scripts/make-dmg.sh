@@ -22,7 +22,7 @@ STAGE="$(mktemp -d)"
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
 
-echo "▸ Creating $DMG…"
+echo "▸ Creating ${DMG}…"
 rm -f "$DMG"
 hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
 rm -rf "$STAGE"
